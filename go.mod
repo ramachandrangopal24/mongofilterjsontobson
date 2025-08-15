@@ -1,4 +1,4 @@
-module jsontobsonmongofilter
+module github.com/ramachandrangopal24/mongofilterjsontobson
 
 go 1.24.5
 
