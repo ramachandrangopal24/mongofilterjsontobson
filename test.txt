@@ -1,0 +1,48 @@
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# 1) Apply security updates (fix CVEs/DSAs)
+RUN apt-get update \
+ && apt-get -y --no-install-recommends upgrade \
+ && apt-get -y --no-install-recommends dist-upgrade \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 2) Install required runtime libraries
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      unixodbc odbcinst libexpat1 ca-certificates tzdata \
+      libpam0g libpam-modules libpam-modules-bin libpam-runtime \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 3) Create non-root user
+RUN addgroup --system app_user && adduser --system --group app_user
+WORKDIR /home/app_user
+
+# 4) Copy build artifacts and TTU .deb files
+COPY --from=builder ./build/app .
+COPY --from=builder ./build/deb/*.deb /tmp/ttu/
+COPY --from=builder ./build/deb/odbcinst.ini /etc/odbcinst.ini
+
+# 5) Install TTU 20.00.00.09 ODBC driver cleanly
+RUN set -eux; \
+    apt-get update; \
+    dpkg -i /tmp/ttu/*.deb || apt-get -y -o Dpkg::Options::="--force-confnew" -f install; \
+    rm -rf /tmp/ttu /var/lib/apt/lists/*
+
+# 6) Configure ODBC for TTU 20.00
+RUN printf "[Teradata ODBC Driver 20.00]\nDriver=/opt/teradata/client/20.00/odbc_64/lib/tdataodbc_sb64.so\n" > /etc/odbcinst.ini && \
+    printf "[TDPROD]\nDriver=Teradata ODBC Driver 20.00\nDBCName=tdprod.company.net\nCharset=UTF8\n" > /etc/odbc.ini
+
+# 7) Cleanup extras and fix permissions
+RUN rm -rf /opt/teradata/client/20.00/odbc_64/samples /opt/teradata/client/20.00/odbc_64/doc && \
+    chown -R app_user:app_user .
+
+# 8) Runtime environment
+ENV ODBCSYSINI=/etc \
+    ODBCINI=/etc/odbc.ini \
+    LD_LIBRARY_PATH=/opt/teradata/client/20.00/lib:/opt/teradata/client/20.00/odbc_64/lib:$LD_LIBRARY_PATH
+
+USER app_user
+CMD ["/home/app_user/app"]
