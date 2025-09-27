@@ -1,0 +1,90 @@
+package main
+
+import (
+	"bufio"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+)
+
+const (
+	InputCSV   = "input.csv"
+	URL        = "https://your.api/endpoint"
+	ChunkSize  = 20000
+	HasHeader  = true
+	ColIndex   = 0
+	MaxRetries = 3
+)
+
+func postJSON(client *http.Client, url string, payload []byte) error {
+	for attempt := 1; attempt <= MaxRetries; attempt++ {
+		req, _ := http.NewRequest("POST", url, bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == MaxRetries {
+				return err
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+		if attempt == MaxRetries {
+			return fmt.Errorf("status %d", resp.StatusCode)
+		}
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	return nil
+}
+
+func main() {
+	f, err := os.Open(InputCSV)
+	if err != nil { panic(err) }
+	defer f.Close()
+
+	r := csv.NewReader(bufio.NewReader(f))
+	if HasHeader {
+		_, _ = r.Read()
+	}
+	client := &http.Client{ Timeout: 60 * time.Second }
+
+	batch := make([]float64, 0, ChunkSize)
+	batchNo := 0
+
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			if err.Error() == "EOF" { break }
+			continue // skip bad lines
+		}
+		if ColIndex >= len(rec) { continue }
+		v, e := strconv.ParseFloat(rec[ColIndex], 64)
+		if e != nil { continue }
+		batch = append(batch, v)
+		if len(batch) == ChunkSize {
+			body, _ := json.Marshal(map[string][]float64{"data": batch})
+			batchNo++
+			fmt.Printf("Posting batch %d with %d items...\n", batchNo, len(batch))
+			if err := postJSON(client, URL, body); err != nil {
+				panic(fmt.Errorf("batch %d failed: %w", batchNo, err))
+			}
+			batch = batch[:0]
+		}
+	}
+	if len(batch) > 0 {
+		body, _ := json.Marshal(map[string][]float64{"data": batch})
+		batchNo++
+		fmt.Printf("Posting batch %d with %d items...\n", batchNo, len(batch))
+		if err := postJSON(client, URL, body); err != nil {
+			panic(fmt.Errorf("batch %d failed: %w", batchNo, err))
+		}
+	}
+	fmt.Printf("Done. Sent %d batches.\n", batchNo)
+}
