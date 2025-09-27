@@ -1,0 +1,160 @@
+// main.go
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+// ---------- CONFIG: tweak these ----------
+const (
+	dirPath       = "./batches"                    // folder with your 20k-line files
+	postURL       = "https://your.api/endpoint"    // target URL
+	processBy     = "MemberCode"                   // per your screenshot
+	sleepBetween  = 15 * time.Minute               // wait time between calls
+	maxRetries    = 3                              // simple retry on network/5xx
+	httpTimeout   = 90 * time.Second               // per request timeout
+	authHeaderEnv = "BULK_AUTH"                    // set env BULK_AUTH="Bearer <token>" if needed
+)
+
+// Optional extra headers. Add more if you need.
+func buildHeaders() map[string]string {
+	h := map[string]string{
+		"Content-Type": "application/json",
+	}
+	if v := os.Getenv(authHeaderEnv); strings.TrimSpace(v) != "" {
+		h["Authorization"] = v
+	}
+	return h
+}
+
+// ---------- minimal request shape ----------
+type bulkRequest struct {
+	Body struct {
+		BulkRequest struct {
+			ProcessBy string   `json:"ProcessBy"`
+			Data      []string `json:"data"`
+		} `json:"BulkRequest"`
+	} `json:"body"`
+}
+
+func main() {
+	// 1) collect files in dir, sort for stable order
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		log.Fatalf("read dir: %v", err)
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		files = append(files, filepath.Join(dirPath, e.Name()))
+	}
+	sort.Strings(files)
+	if len(files) == 0 {
+		log.Fatalf("no files in %s", dirPath)
+	}
+
+	client := &http.Client{Timeout: httpTimeout}
+	headers := buildHeaders()
+
+	for i, path := range files {
+		lines, err := readLines(path)
+		if err != nil {
+			log.Fatalf("read %s: %v", path, err)
+		}
+		if len(lines) == 0 {
+			log.Printf("skip %s (no lines)", path)
+			continue
+		}
+
+		var req bulkRequest
+		req.Body.BulkRequest.ProcessBy = processBy
+		req.Body.BulkRequest.Data = lines
+
+		payload, err := json.Marshal(req)
+		if err != nil {
+			log.Fatalf("marshal %s: %v", path, err)
+		}
+
+		log.Printf("POST %s  | file %d/%d | %s | items=%d", postURL, i+1, len(files), filepath.Base(path), len(lines))
+		if err := postWithRetry(client, postURL, headers, payload, maxRetries); err != nil {
+			log.Fatalf("post failed for %s: %v", path, err)
+		}
+		log.Printf("✔ sent %s (%d items)", filepath.Base(path), len(lines))
+
+		// sleep 15 minutes before next file (skip sleep after last file)
+		if i < len(files)-1 {
+			log.Printf("⏳ waiting %s before next file…", sleepBetween)
+			time.Sleep(sleepBetween)
+		}
+	}
+
+	log.Printf("Done. Sent %d file(s).", len(files))
+}
+
+func readLines(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []string
+	sc := bufio.NewScanner(f)
+	// raise Scanner buffer if your lines can be long
+	buf := make([]byte, 0, 1024*64)
+	sc.Buffer(buf, 1024*1024)
+
+	for sc.Scan() {
+		s := strings.TrimSpace(sc.Text())
+		if s == "" {
+			continue // skip blanks
+		}
+		out = append(out, s) // treat each line as a string MemberCode
+	}
+	return out, sc.Err()
+}
+
+func postWithRetry(client *http.Client, url string, headers map[string]string, body []byte, retries int) error {
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt*attempt) * time.Second
+			time.Sleep(backoff)
+		}
+		req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == retries {
+				return err
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+		if attempt == retries {
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+	}
+	return fmt.Errorf("unreachable")
+}
